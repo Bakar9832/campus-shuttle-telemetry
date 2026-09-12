@@ -1,0 +1,65 @@
+services:
+  timescale:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-telemetry}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-telemetry}
+      POSTGRES_DB: ${POSTGRES_DB:-telemetry}
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale-data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-telemetry} -d ${POSTGRES_DB:-telemetry}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+
+  ingest:
+    build: ./services/ingest
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-telemetry}:${POSTGRES_PASSWORD:-telemetry}@timescale:5432/${POSTGRES_DB:-telemetry}
+      MQTT_URL: mqtt://mosquitto:1883
+      FLUSH_MS: 500
+      MAX_BATCH: 200
+    depends_on:
+      timescale:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+    restart: unless-stopped
+
+  api:
+    build: ./services/api
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-telemetry}:${POSTGRES_PASSWORD:-telemetry}@timescale:5432/${POSTGRES_DB:-telemetry}
+      API_PORT: 3000
+    ports:
+      - "3000:3000"
+    depends_on:
+      timescale:
+        condition: service_healthy
+    restart: unless-stopped
+
+  simulator:
+    build: ./services/simulator
+    environment:
+      MQTT_URL: mqtt://mosquitto:1883
+      FLEET_SIZE: ${FLEET_SIZE:-1}
+      TICK_MS: ${TICK_MS:-1000}
+      ROUTE_FILE: ./routes/campus-loop.json
+    depends_on:
+      mosquitto:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  timescale-data:
