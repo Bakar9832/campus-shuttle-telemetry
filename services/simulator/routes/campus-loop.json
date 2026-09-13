@@ -1,0 +1,12 @@
+{
+  "id": "campus-loop",
+  "name": "Main Campus Loop",
+  "stops": [
+    { "id": "north-gate",   "name": "North Gate",       "lat": 40.00750, "lon": -83.02900, "dwellSec": 25 },
+    { "id": "library",      "name": "Library Green",    "lat": 40.00520, "lon": -83.02450, "dwellSec": 30 },
+    { "id": "health-sci",   "name": "Health Sciences",  "lat": 40.00180, "lon": -83.02210, "dwellSec": 40 },
+    { "id": "rec-center",   "name": "Rec Center",       "lat": 39.99880, "lon": -83.02620, "dwellSec": 25 },
+    { "id": "south-lot",    "name": "South Lot",        "lat": 39.99950, "lon": -83.03210, "dwellSec": 20 },
+    { "id": "eng-quad",     "name": "Engineering Quad", "lat": 40.00400, "lon": -83.03350, "dwellSec": 30 }
+  ]
+}
