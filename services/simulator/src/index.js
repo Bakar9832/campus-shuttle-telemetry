@@ -8,6 +8,7 @@ const MQTT_URL   = process.env.MQTT_URL ?? 'mqtt://localhost:1883';
 const FLEET_SIZE = Number(process.env.FLEET_SIZE ?? 1);
 const TICK_MS    = Number(process.env.TICK_MS ?? 1000);
 const ROUTE_FILE = process.env.ROUTE_FILE ?? path.resolve('routes/campus-loop.json');
+const MAX_BUFFER = Number(process.env.MAX_BUFFER ?? 3600);
 
 const routeDef = JSON.parse(fs.readFileSync(ROUTE_FILE, 'utf8'));
 const route = buildRoute(routeDef.stops);
@@ -44,6 +45,29 @@ const clients = vehicles.map((veh) => {
     },
   });
 
+  const pending = [];
+  let droppedFromBuffer = 0;
+
+  function buffer(reading) {
+    if (pending.length >= MAX_BUFFER) {
+      pending.shift();
+      droppedFromBuffer++;
+      if(droppedFromBuffer % 100 === 1) {
+        console.warn(`[sim] ${veh.id} buffer full - dropped ${droppedFromBuffer} oldest`);
+      }
+    }
+    pending.push(reading);
+  }
+
+  function replay() {
+    if(pending.length === 0) return;
+    console.log(`[sim] ${veh.id} replaying ${pending.length} buffered readings`);
+    const backlog = pending.splice(0, pending.length);
+    for (const reading of backlog) {
+      client.publish(telemetryTopic(veh.id), JSON.stringify(reading), { qos: 1 });
+    }
+  }
+
   client.on('connect', () => {
     console.log(`[sim] ${veh.id} connected`);
     client.publish(
@@ -51,17 +75,18 @@ const clients = vehicles.map((veh) => {
       JSON.stringify({ vehicleId: veh.id, online: true, ts: new Date().toISOString() }),
       { qos: 1, retain: true },
     );
+    replay();
   });
 
   client.on('error', (err) => console.error(`[sim] ${veh.id} mqtt error: ${err.message}`));
-  return { veh, client };
+  return { veh, client, buffer };
 });
 
 const dt = TICK_MS / 1000;
 const timer = setInterval(() => {
-  for (const { veh, client } of clients) {
+  for (const {veh, client, buffer} of clients) {
     const reading = veh.tick(dt);
-    if (!client.connected) continue;   // slice 2 will buffer these instead
+    if (!client.connected) {buffer(reading); continue;}
     client.publish(telemetryTopic(veh.id), JSON.stringify(reading), { qos: 1 });
   }
 }, TICK_MS);
