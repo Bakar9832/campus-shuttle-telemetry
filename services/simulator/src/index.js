@@ -13,6 +13,8 @@ const MAX_BUFFER = Number(process.env.MAX_BUFFER ?? 3600);
 const DROPOUT_CHANCE  = Number(process.env.DROPOUT_CHANCE ?? 0.001);
 const DROPOUT_MIN_SEC = Number(process.env.DROPOUT_MIN_SEC ?? 30);
 const DROPOUT_MAX_SEC = Number(process.env.DROPOUT_MAX_SEC ?? 180);
+const REPLAY_SHUFFLE   = (process.env.REPLAY_SHUFFLE ?? 'true') === 'true';
+const DUPLICATE_CHANCE = Number(process.env.DUPLICATE_CHANCE ?? 0.02);
 
 const routeDef = JSON.parse(fs.readFileSync(ROUTE_FILE, "utf8"));
 const route = buildRoute(routeDef.stops);
@@ -91,17 +93,39 @@ const clients = vehicles.map((veh) => {
     return true;
   }
 
-  function replay() {
+    function replay() {
     if (pending.length === 0) return;
-    console.log(
-      `[sim] ${veh.id} replaying ${pending.length} buffered readings`,
-    );
     const backlog = pending.splice(0, pending.length);
-    for (const reading of backlog) {
-      client.publish(telemetryTopic(veh.id), JSON.stringify(reading), {
-        qos: 1,
-      });
+
+    // A device reconnecting does not politely send its backlog oldest-first.
+    // Buffered readings go out as fast as the link allows and arrive
+    // interleaved, so shuffling here is the realistic case, not the edge case.
+    if (REPLAY_SHUFFLE) {
+      for (let i = backlog.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [backlog[i], backlog[j]] = [backlog[j], backlog[i]];
+      }
     }
+
+    console.log(
+      `[sim] ${veh.id} replaying ${backlog.length} buffered reading(s)` +
+      (REPLAY_SHUFFLE ? ' (out of order)' : ''),
+    );
+
+    let duplicates = 0;
+    for (const reading of backlog) {
+      client.publish(telemetryTopic(veh.id), JSON.stringify(reading), { qos: 1 });
+
+      // QoS 1 is at-least-once: a lost broker acknowledgement makes the client
+      // resend a reading it already delivered. Idempotent writes are what make
+      // that harmless, so the simulator produces the condition on purpose.
+      if (Math.random() < DUPLICATE_CHANCE) {
+        client.publish(telemetryTopic(veh.id), JSON.stringify(reading), { qos: 1 });
+        duplicates += 1;
+      }
+    }
+
+    if (duplicates > 0) console.log(`[sim] ${veh.id} redelivered ${duplicates} reading(s)`);
   }
 
   client.on("connect", () => {

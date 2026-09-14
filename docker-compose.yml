@@ -60,6 +60,8 @@ services:
       DROPOUT_MIN_SEC: ${DROPOUT_MIN_SEC:-30}
       DROPOUT_MAX_SEC: ${DROPOUT_MAX_SEC:-180}
       MAX_BUFFER: ${MAX_BUFFER:-3600}
+      REPLAY_SHUFFLE: ${REPLAY_SHUFFLE:-true}
+      DUPLICATE_CHANCE: ${DUPLICATE_CHANCE:-0.02}
     depends_on:
       mosquitto:
         condition: service_started
