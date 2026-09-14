@@ -56,6 +56,10 @@ services:
       FLEET_SIZE: ${FLEET_SIZE:-1}
       TICK_MS: ${TICK_MS:-1000}
       ROUTE_FILE: ./routes/campus-loop.json
+      DROPOUT_CHANCE: ${DROPOUT_CHANCE:-0.001}
+      DROPOUT_MIN_SEC: ${DROPOUT_MIN_SEC:-30}
+      DROPOUT_MAX_SEC: ${DROPOUT_MAX_SEC:-180}
+      MAX_BUFFER: ${MAX_BUFFER:-3600}
     depends_on:
       mosquitto:
         condition: service_started
