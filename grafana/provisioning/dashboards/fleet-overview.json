@@ -1,0 +1,243 @@
+{
+  "uid": "fleet-overview",
+  "title": "Fleet Overview",
+  "tags": ["telemetry", "fleet"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "geomap",
+      "title": "Live positions",
+      "description": "Most recent reading per vehicle, device clock ordered. A vehicle that is offline stays at its last known position until its backlog arrives.",
+      "gridPos": { "h": 12, "w": 16, "x": 0, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "telemetry-db" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT DISTINCT ON (vehicle_id)\n  vehicle_id,\n  lat AS latitude,\n  lon AS longitude,\n  speed_kph,\n  battery_pct\nFROM telemetry\nWHERE device_ts > now() - interval '15 minutes'\nORDER BY vehicle_id, device_ts DESC"
+        }
+      ],
+      "options": {
+        "view": { "id": "coords", "lat": 40.0031, "lon": -83.0278, "zoom": 15 },
+        "basemap": { "type": "osm-standard", "name": "OpenStreetMap" },
+        "layers": [
+          {
+            "type": "markers",
+            "name": "Vehicles",
+            "location": { "mode": "coords", "latitude": "latitude", "longitude": "longitude" },
+            "config": {
+              "style": {
+                "size": { "fixed": 8 },
+                "color": { "field": "speed_kph", "fixed": "green" },
+                "opacity": 0.9,
+                "textConfig": { "fontSize": 12, "offsetY": -14, "textAlign": "center" }
+              },
+              "showLegend": true
+            }
+          }
+        ],
+        "controls": { "showZoom": true, "showAttribution": true }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "continuous-GrYlRd" },
+          "unit": "velocitykmh"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Fleet status",
+      "description": "Driven by MQTT connect and last-will messages, not by polling. A vehicle goes offline within about a second of losing its connection.",
+      "gridPos": { "h": 12, "w": 8, "x": 16, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "telemetry-db" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  v.id AS \"Vehicle\",\n  CASE WHEN s.online THEN 'online' ELSE 'OFFLINE' END AS \"State\",\n  round(EXTRACT(EPOCH FROM (now() - s.last_seen))::numeric) AS \"Silent (s)\"\nFROM vehicle v\nLEFT JOIN vehicle_status s ON s.vehicle_id = v.id\nORDER BY s.online ASC, v.id"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "left" } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "State" },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": { "type": "color-text" }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  { "type": "value", "options": { "online": { "color": "green", "index": 0 } } },
+                  { "type": "value", "options": { "OFFLINE": { "color": "red", "index": 1 } } }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": { "showHeader": true }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Readings per minute — by device clock vs by arrival",
+      "description": "The same data bucketed two ways. Device clock stays near the true sample rate because replayed readings fill in retroactively. Arrival drops to zero during an outage and spikes when the backlog lands.",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "postgres", "uid": "telemetry-db" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  time_bucket('1 minute', device_ts) AS time,\n  count(*) AS \"by device clock\"\nFROM telemetry\nWHERE $__timeFilter(device_ts)\nGROUP BY time\nORDER BY time"
+        },
+        {
+          "refId": "B",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  time_bucket('1 minute', received_at) AS time,\n  count(*) AS \"by arrival\"\nFROM telemetry\nWHERE $__timeFilter(received_at)\nGROUP BY time\nORDER BY time"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "lineWidth": 2, "fillOpacity": 8, "showPoints": "never" }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Delivery lag percentiles",
+      "description": "received_at minus device_ts. p50 is the steady state. p99 spikes to the length of an outage when a buffered backlog is replayed.",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "postgres", "uid": "telemetry-db" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  time_bucket('1 minute', received_at) AS time,\n  percentile_cont(0.50) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (received_at - device_ts))) AS p50,\n  percentile_cont(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (received_at - device_ts))) AS p95,\n  percentile_cont(0.99) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (received_at - device_ts))) AS p99\nFROM telemetry\nWHERE $__timeFilter(received_at)\nGROUP BY time\nORDER BY time"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "lineWidth": 2, "fillOpacity": 0, "showPoints": "never" }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Readings stored",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 21 },
+      "datasource": { "type": "postgres", "uid": "telemetry-db" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count(*) AS value FROM telemetry WHERE $__timeFilter(device_ts)"
+        }
+      ],
+      "options": { "colorMode": "value", "graphMode": "none", "textMode": "value" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "text" } }, "overrides": [] }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Missed-tick gaps",
+      "description": "Intervals longer than two seconds between consecutive readings, device clock ordered. Zero means every second of the journey was recovered despite the outages.",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 21 },
+      "datasource": { "type": "postgres", "uid": "telemetry-db" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count(*) AS value FROM (\n  SELECT device_ts - lag(device_ts) OVER (PARTITION BY vehicle_id ORDER BY device_ts) AS d\n  FROM telemetry\n  WHERE $__timeFilter(device_ts)\n) g WHERE d > interval '2 seconds'"
+        }
+      ],
+      "options": { "colorMode": "value", "graphMode": "none", "textMode": "value" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Duplicate rows",
+      "description": "Rows sharing a (vehicle_id, device_ts) key. Always zero: redelivered readings hit ON CONFLICT DO NOTHING and are discarded by the database, not by application code.",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 21 },
+      "datasource": { "type": "postgres", "uid": "telemetry-db" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count(*) AS value FROM (\n  SELECT vehicle_id, device_ts\n  FROM telemetry\n  WHERE $__timeFilter(device_ts)\n  GROUP BY 1, 2\n  HAVING count(*) > 1\n) d"
+        }
+      ],
+      "options": { "colorMode": "value", "graphMode": "none", "textMode": "value" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Worst delivery lag",
+      "description": "Oldest reading in a replayed backlog. Bounded by outage length, which is what proves the buffer is not leaking.",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 21 },
+      "datasource": { "type": "postgres", "uid": "telemetry-db" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT COALESCE(max(EXTRACT(EPOCH FROM (received_at - device_ts))), 0) AS value\nFROM telemetry\nWHERE $__timeFilter(device_ts)"
+        }
+      ],
+      "options": { "colorMode": "value", "graphMode": "none", "textMode": "value" },
+      "fieldConfig": { "defaults": { "unit": "s", "decimals": 1, "color": { "mode": "fixed", "fixedColor": "text" } }, "overrides": [] }
+    }
+  ]
+}
