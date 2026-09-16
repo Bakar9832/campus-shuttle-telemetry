@@ -1,5 +1,7 @@
 # Campus Shuttle Telemetry
 
+![CI](https://github.com/Bakar9832/campus-shuttle-telemetry/actions/workflows/ci.yml/badge.svg)
+
 A telemetry platform for a campus shuttle fleet: simulated vehicles publish position
 and state over MQTT, an ingestion service writes to a TimescaleDB hypertable, and a
 REST API serves live positions and historical tracks.
