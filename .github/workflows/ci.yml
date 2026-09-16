@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  integration:
+    name: Stack integration under fault injection
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create .env
+        run: |
+          cp .env.example .env
+          # Faults far above the realistic default, so a short CI run is
+          # guaranteed to exercise dropout, buffered replay, out-of-order
+          # delivery and duplicate redelivery.
+          {
+            echo "FLEET_SIZE=6"
+            echo "DROPOUT_CHANCE=0.04"
+            echo "DROPOUT_MIN_SEC=10"
+            echo "DROPOUT_MAX_SEC=25"
+            echo "REPLAY_SHUFFLE=true"
+            echo "DUPLICATE_CHANCE=0.05"
+          } >> .env
+
+      - name: Build images
+        run: docker compose build
+
+      - name: Start stack
+        run: docker compose up -d
+
+      - name: Wait for database
+        run: |
+          for i in $(seq 1 30); do
+            if docker compose exec -T timescale pg_isready -U telemetry -d telemetry; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "timescale never reported ready" >&2
+          exit 1
+
+      - name: Run integration checks
+        run: bash ci/verify.sh
+        env:
+          RUN_SECONDS: 120
+          MIN_READINGS: 400
+
+      - name: Service logs
+        if: always()
+        run: |
+          echo "::group::simulator"
+          docker compose logs --tail 120 simulator
+          echo "::endgroup::"
+          echo "::group::ingest"
+          docker compose logs --tail 120 ingest
+          echo "::endgroup::"
+          echo "::group::api"
+          docker compose logs --tail 60 api
+          echo "::endgroup::"
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
