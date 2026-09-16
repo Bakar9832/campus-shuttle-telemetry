@@ -10,9 +10,11 @@ Built to answer a specific question — what does it actually take to keep a fle
 worth of unreliable, intermittently-connected devices producing data you can trust
 enough to put on a map and bill against.
 
-**Status:** slice 2 — fault injection, verified against a running stack. See
-[Fault injection](#fault-injection-slice-2) for the queries and their output, and
-[Roadmap](#roadmap) for what is next.
+**Headline result:** over a 67-minute run the vehicle was unreachable for roughly
+92% of the time, across 123 separate outages. Zero readings lost, zero duplicate
+rows. The [queries and their output](#fault-injection-slice-2) are below.
+
+**Status:** slices 1, 2 and 4 complete. See [Roadmap](#roadmap) for what is next.
 
 ---
 
@@ -33,17 +35,28 @@ enough to put on a map and bill against.
                                        ▼
                               ┌──────────────────┐
                               │   TimescaleDB    │  telemetry hypertable
-                              └────────┬─────────┘
-                                       │
-                                       ▼
-                                 ┌────────────┐
-                                 │    api     │  REST + OpenAPI at /docs
-                                 └────────────┘
+                              └───┬──────────┬───┘
+                                  │          │
+                                  ▼          ▼
+                          ┌────────────┐  ┌────────────┐
+                          │    api     │  │  grafana   │
+                          │ REST +     │  │ provisioned│
+                          │ OpenAPI    │  │ dashboards │
+                          └────────────┘  └────────────┘
 ```
 
 Each simulated vehicle holds its own broker connection with its own last-will
 message, because that is how the real units behave and it is what makes offline
 detection work without a heartbeat table.
+
+![Fleet Overview dashboard](docs/dashboard.png)
+
+The readings-per-minute panel is the design in one picture. During an outage the
+*by arrival* line collapses and then spikes as the backlog lands, while the
+*by device clock* line stays flat at the true sample rate — the journey was never
+interrupted, only its delivery. The gap and duplicate tiles are the integrity
+queries from [below](#fault-injection-slice-2), running live; they turn red if
+either stops being zero.
 
 ## Running it
 
@@ -56,10 +69,15 @@ Then:
 
 | What | Where |
 |---|---|
+| Grafana dashboards | http://localhost:3001 |
 | API docs (Swagger UI) | http://localhost:3000/docs |
 | Live fleet positions | http://localhost:3000/fleet/positions |
 | Health | http://localhost:3000/health |
 | Ingest rate, last hour | http://localhost:3000/metrics/ingest |
+
+Grafana is provisioned from `grafana/provisioning/` — datasource and dashboard both
+come from the repo, and anonymous viewers get read access, so there is nothing to
+click together after a clone.
 
 Watch a vehicle move:
 
@@ -77,6 +95,26 @@ and follow the simulator log:
 ```bash
 docker compose logs -f simulator | grep -E 'coverage|replaying|redelivered'
 ```
+
+## CI
+
+Every push stands up the whole stack on a clean runner, runs it for two minutes with
+fault injection turned up, and then asserts against what actually reached the
+database:
+
+- readings are being written at all
+- buffered replay was observed
+- zero missed ticks in the reconstructed track
+- zero duplicate rows
+- zero messages rejected by validation
+- read path monotonic on `device_ts`
+- API healthy and serving live positions
+
+The second assertion is the one that matters most. Without it the integrity checks
+would pass trivially on a run where nothing ever disconnected, and a test that can
+pass without exercising the thing it tests is worse than no test at all. The checks
+live in [`ci/verify.sh`](ci/verify.sh) rather than inside the workflow YAML, so they
+are readable and runnable locally.
 
 ## Design notes
 
@@ -97,6 +135,13 @@ INSERT every 500 ms or 200 messages, whichever comes first. At one vehicle this 
 pointless; at a few hundred it is the difference between a working ingest path and
 a connection-starved one. A failed flush returns the batch to the buffer rather than
 dropping it.
+
+**Drop oldest, not newest.** A device buffering offline has finite storage. When the
+buffer fills, the oldest readings are discarded and counted. This is an operational
+tool: a dispatcher asking where a vehicle is now needs the newest reading, and a
+reading from forty minutes ago is worth almost nothing by comparison. A tachograph or
+a billing-by-distance system would make the opposite choice, because there a gap is a
+compliance failure.
 
 **Malformed input is data, not an outage.** Validation rejects and counts bad
 readings per reason. One bad firmware build should not stop ingestion for the fleet.
@@ -129,7 +174,9 @@ detection is not simulated at a higher layer; it is the actual MQTT mechanism.
 
 The run measured below is a single continuous 67-minute window of the fixed build,
 captured 2026-09-14 11:43:21–12:50:00 UTC: **one vehicle at 1 Hz, 123 outages,
-122 replays, 3835 readings replayed, 72 deliberate redeliveries.** Every query is
+122 replays, 3835 readings replayed, 72 deliberate redeliveries.** At an average
+outage of roughly 30 seconds, that leaves under three seconds of connectivity
+between outages — the vehicle spent about 92% of the run unreachable. Every query is
 pinned to that window, so the output reproduces against the stored data rather than
 drifting with the clock.
 
@@ -188,8 +235,13 @@ FROM d GROUP BY build ORDER BY build;
 ```
 
 Every one of those 16 gaps was exactly `00:00:02.002` — a single missing tick,
-one per outage, which is the bug's signature. After the fix, 67 minutes and 123
-outages produce an unbroken 1 Hz series: 3995 readings, no gap wider than a tick.
+one per outage, which is the bug's signature. A stall would produce gaps of varying
+length; sixteen identical two-second holes is this bug and nothing else. After the
+fix, 67 minutes and 123 outages produce an unbroken 1 Hz series: 3995 readings, no
+gap wider than a tick.
+
+Worth stating plainly: nobody would have found this by reading the code. It only
+surfaced because the verification query counted something that could be wrong.
 
 ### Duplicates are free
 
@@ -217,6 +269,12 @@ WHERE vehicle_id = 'shuttle-01'
 
 72 redeliveries were published by the simulator over that window. None of them
 reached the table as a row.
+
+This is a deliberate trade. QoS 2 would guarantee exactly-once delivery, but it
+costs a four-step handshake per message, and at a few hundred vehicles on cellular
+data that is not worth paying for. Taking the cheaper at-least-once guarantee and
+absorbing the consequence in the schema is the better deal — and it costs no
+application code at all.
 
 ### Out-of-order arrival is the normal case
 
@@ -248,8 +306,11 @@ FROM t;
 (1 row)
 ```
 
-84% of readings arrived after something newer. Worst lag is 45.1 s, which is exactly
-`DROPOUT_MAX_SEC` — the backlog is bounded by the outage length, as it should be.
+84% of readings arrived after something newer. That is not an edge case handled
+defensively — it is the dominant condition, and any system that assumed arrival
+order would be wrong most of the time. Worst lag is 45.1 s, which is exactly
+`DROPOUT_MAX_SEC`: the backlog is bounded by the outage length, which is how you
+know the buffer is not leaking.
 
 This is the payoff for storing two clocks. Ordered by arrival the track is
 nonsense; ordered by `device_ts` it is correct, and the read path does the latter:
@@ -273,19 +334,23 @@ Every reading here carries a device clock that is merely *late*, never *wrong*.
 Real units drift, and some come back from a cold boot in 1970 or a few hours off,
 which breaks a `(vehicle_id, device_ts)` primary key in a way buffering does not —
 two genuinely different readings can collide, and `ON CONFLICT DO NOTHING` would
-silently discard the second. That needs a sequence-aware key or a skew correction
-on ingest, so it is deliberately held back rather than half-implemented.
+silently discard the second. The same mechanism that makes duplicates free makes
+skew lossy. Fixing it properly means a sequence-aware key or a skew correction on
+ingest, so it is deliberately held back rather than half-implemented.
 
 ## Roadmap
 
 - [x] **Slice 1** — simulator, broker, ingest, TimescaleDB, REST + OpenAPI, all in compose
 - [x] **Slice 2** — fault injection: dropouts, reconnects with buffered replay, out-of-order
       and duplicate delivery. Measured: 0 lost readings and 0 duplicate rows across 123
-      outages. Clock skew is deliberately deferred — see below.
+      outages. Clock skew deliberately deferred — see above.
+- [x] **Slice 4** — Grafana, provisioned from the repo: geomap of live positions, readings
+      per minute by device clock vs arrival, delivery lag percentiles, and gap and
+      duplicate tiles that go red if either stops being zero
+- [x] **CI** — full stack stood up on every push, fault injection enabled, build fails if a
+      single reading is lost or duplicated
 - [ ] **Slice 3** — domain layer: routes, stops, schedules, driver assignment, geofences,
       speed thresholds, scheduled lock/unlock, alerting
-- [ ] **Slice 4** — Grafana: geomap of live positions, ingestion rate, latency percentiles,
-      offline devices, zone violations
 - [ ] **Slice 5** — Kubernetes with horizontal autoscaling under simulated fleet load
 - [ ] **Slice 6** — Terraform for the whole stack, remote state, dev/prod workspaces
 - [ ] **Slice 7** — second vertical (hospital patient transport) on the same core, as proof
@@ -294,8 +359,11 @@ on ingest, so it is deliberately held back rather than half-implemented.
 ## Repo layout
 
 ```
+.github/workflows/  CI pipeline
+ci/verify.sh        integration assertions, runnable locally
 db/init/            schema, applied on first database start
 mosquitto/          broker config
+grafana/            provisioned datasource and dashboard
 services/simulator/ vehicle motion model + MQTT publisher
 services/ingest/    subscriber, validation, batched writes
 services/api/       read API and OpenAPI spec
