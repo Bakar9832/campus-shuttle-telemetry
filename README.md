@@ -3,8 +3,9 @@
 ![CI](https://github.com/Bakar9832/campus-shuttle-telemetry/actions/workflows/ci.yml/badge.svg)
 
 A telemetry platform for a campus shuttle fleet: simulated vehicles publish position
-and state over MQTT, an ingestion service writes to a TimescaleDB hypertable, and a
-REST API serves live positions and historical tracks.
+and state over MQTT, an ingestion service writes to a TimescaleDB hypertable, a
+detector turns that stream into alert episodes, and a REST API serves live positions,
+historical tracks and alerts.
 
 Built to answer a specific question — what does it actually take to keep a fleet's
 worth of unreliable, intermittently-connected devices producing data you can trust
@@ -14,7 +15,7 @@ enough to put on a map and bill against.
 92% of the time, across 123 separate outages. Zero readings lost, zero duplicate
 rows. The [queries and their output](#fault-injection-slice-2) are below.
 
-**Status:** slices 1, 2, 4 and 5 complete. Runs under Docker Compose or Kubernetes.
+**Status:** slices 1–5 complete. Runs under Docker Compose or Kubernetes.
 See [Roadmap](#roadmap) for what is next.
 
 ---
@@ -34,9 +35,11 @@ See [Roadmap](#roadmap) for what is next.
                                  └─────┬──────┘
                                        │
                                        ▼
-                              ┌──────────────────┐
-                              │   TimescaleDB    │  telemetry hypertable
-                              └───┬──────────┬───┘
+                              ┌──────────────────┐        ┌────────────┐
+                              │   TimescaleDB    │◄──────►│  detector  │
+                              │ telemetry, zone, │        │ episodes,  │
+                              │ alert, cursor    │        │ watermark  │
+                              └───┬──────────┬───┘        └────────────┘
                                   │          │
                                   ▼          ▼
                           ┌────────────┐  ┌────────────┐
@@ -73,6 +76,7 @@ Then:
 | Grafana dashboards | http://localhost:3001 |
 | API docs (Swagger UI) | http://localhost:3000/docs |
 | Live fleet positions | http://localhost:3000/fleet/positions |
+| Open alerts | http://localhost:3000/alerts?open=true |
 | Health | http://localhost:3000/health |
 | Ingest rate, last hour | http://localhost:3000/metrics/ingest |
 
@@ -95,6 +99,13 @@ and follow the simulator log:
 
 ```bash
 docker compose logs -f simulator | grep -E 'coverage|replaying|redelivered'
+```
+
+To watch alerts open and close, lower the speed limit below the 30 km/h cruise
+(`SPEED_LIMIT_KPH=25`) and follow the detector:
+
+```bash
+docker compose logs -f detector
 ```
 
 ## CI
@@ -339,6 +350,233 @@ silently discard the second. The same mechanism that makes duplicates free makes
 skew lossy. Fixing it properly means a sequence-aware key or a skew correction on
 ingest, so it is deliberately held back rather than half-implemented.
 
+## Domain layer (slice 3)
+
+Slices 1 and 2 move readings from devices to a database and serve them back. That is
+a pipe. Slice 3 is what makes it a platform: a `detector` service that turns the
+position stream into things an operator would act on — a bus in a restricted zone, a
+bus over the limit, a bus that has gone dark.
+
+Three alert types, each with its own closing condition:
+
+| Type | Subject | Opens when | Closes when |
+|---|---|---|---|
+| `speeding` | — (or a zone id) | speed above the limit | a reading shows it back under, or timeout |
+| `zone_violation` | zone id | inside a forbidden zone, or outside a required one | a reading shows it compliant, or timeout |
+| `offline` | — | no reading for `OFFLINE_AFTER_SEC` | a reading arrives |
+
+Zones are polygons with a rule. `inside_allowed = true` means the vehicle must stay
+in (a campus boundary); `false` means it must stay out (a service yard). One shape,
+two opposite rules, so the detector has one code path and only the comparison flips.
+Point-in-polygon is ray casting in about fifteen lines — no PostGIS, for the same
+reason there is no geo library in the simulator.
+
+### Episodes, not instants
+
+The first design decision, and the one everything else follows from.
+
+A bus speeding for forty seconds at 1 Hz produces forty violating readings. Storing
+one alert per reading gives an operator forty rows for one event and a dashboard
+nobody can read. So an alert is an **episode**: it opens when the condition starts
+and closes when it stops.
+
+That makes the natural key `(vehicle_id, alert_type, subject, opened_at)`. Each part
+earns its place:
+
+- **`opened_at` is the device clock**, not the detection time. Reprocess the same
+  window and you compute the same opening timestamp, so the insert collapses under
+  `ON CONFLICT DO NOTHING` — the same idempotency trick as the telemetry writes, one
+  layer up. A vehicle leaving and re-entering a zone fifteen times is fifteen
+  episodes, because each has a different `opened_at`.
+- **`subject` names what the alert is about** — a zone id, empty for alerts with no
+  subject. Without it, two overlapping zones violated simultaneously would collide on
+  the key and the second violation would be silently discarded. That is the same
+  failure mode as the clock-skew hole above: the mechanism that makes duplicates free
+  makes genuinely distinct things collide.
+
+### Where detection runs, and why it is deliberately late
+
+Three options were on the table: evaluate inside `ingest` as each message arrives,
+run a second MQTT subscriber, or poll the database. The first two are lower latency
+and both are wrong here.
+
+84% of readings arrive after something newer. A detector reading the live stream
+would evaluate a reading from forty seconds ago against state built from readings
+that came after it — firing exit alerts for conditions that ended half a minute
+earlier, and firing them again on every replay.
+
+So the detector polls the database in `device_ts` order, behind a **watermark**: it
+only looks at readings older than `now() - WATERMARK_SEC`. At 60 seconds, against a
+measured worst delivery lag of 45.1 s, everything around a reading has almost
+certainly arrived by the time it is evaluated, and processing in device order is
+safe.
+
+That is a minute of deliberate lag bought in exchange for correctness. A geofence
+violation reported 60 seconds late is still actionable; one reported three times is
+not.
+
+Two consequences:
+
+- **A cursor**, stored in `detector_cursor`, records how far processing has reached.
+  It advances only on a successful cycle, so a failed cycle is retried rather than
+  skipped — and because `reconcile()` will not reopen an episode it can see is open,
+  reprocessing produces no duplicate alerts. State in the database rather than in
+  memory is also what lets the detector run as a stateless Deployment: pods are
+  replaced routinely, and an in-memory version would forget every open episode on
+  each deploy and then reopen them all as new alerts.
+- **The watermark advances regardless of silence.** A bus offline for two hours does
+  not block it. When that backlog finally lands, those readings are older than the
+  cursor and are skipped — so retrospective detection for very late data is lost.
+  That is the right call for an operational alert and the wrong one for compliance,
+  which would need a separate backfill job.
+
+### Closed how, not just closed
+
+An episode closes for one of two reasons, and the distinction is the point.
+
+`resolved` means a reading proved the condition ended. `timed_out` means the vehicle
+stopped reporting and we lost the ability to tell. A bus that sped for ten seconds
+and slowed down, and a bus that sped for ten seconds and vanished, look identical if
+you only record "no longer speeding".
+
+So "not violating" only counts when a reading from that vehicle says so. Silence is
+handled separately:
+
+```
+for each reading, in device_ts order:
+    violations = evaluate(reading)
+    open episodes for this vehicle NOT in violations → close as 'resolved'
+    violations NOT already open                      → open new episode
+    violations already open                          → update peak
+
+after all readings:
+    open episodes whose vehicle has no reading newer than (watermark - timeout)
+        → close as 'timed_out'
+```
+
+`closed_at` for a timeout is the vehicle's **last known reading**, not the moment of
+detection. Record detection time instead and every timed-out episode reads as three
+minutes longer than it was, quietly skewing any duration statistic built on it.
+
+**Sizing the timeout.** The obvious move is to reuse the watermark's 60 seconds. That
+is too tight, because the two numbers measure different things. Worst case, an outage
+starts at T, ends at T + 45 when the backlog lands, and the watermark holds those
+readings for another 60 seconds before the detector sees them — so the closing
+reading is not evaluated until T + 105. A 60-second timeout would have closed the
+episode at T + 60 and the real close would arrive to find it already shut. The rule
+is **timeout > max_outage + watermark**; the default is 120 seconds.
+
+### The offline alert breaks the rule
+
+`speeding` and `zone_violation` are computed from a reading. `offline` cannot be —
+there is no reading. It is driven by `vehicle_status.last_seen`, which is maintained
+from MQTT connect and last-will messages.
+
+The first version fired, then immediately closed itself, then fired again:
+
+```
+OPEN  offline shuttle-02 at 22:18:21.857
+CLOSE offline shuttle-02 (timed_out)
+OPEN  offline shuttle-02 at 22:18:21.857
+OPEN  offline shuttle-02 at 22:18:21.857
+OPEN  offline shuttle-02 at 22:18:21.857
+```
+
+The timeout sweep closes any open episode whose vehicle has gone quiet — and an
+offline episode is *about* the vehicle being quiet. So it opened, was immediately
+timed out, and reopened on the next cycle, forever. The repeated OPEN lines with no
+new rows are `ON CONFLICT DO NOTHING` absorbing them: the database was protecting the
+data while the log lied and the detector burned a cycle every three seconds.
+
+The fix is one line — offline episodes are excluded from the timeout sweep. The
+general shape is worth naming, because it is the second time it has come up in this
+project: a rule that is correct for every case considered when it was written, and
+wrong for the case added afterwards.
+
+With the exclusion in place, the same silence does two different things at once:
+
+```
+OPEN  offline shuttle-02 at 2026-09-17T22:24:50.944Z
+CLOSE speeding shuttle-02 (timed_out)
+OPEN  offline shuttle-01 at 2026-09-17T22:25:00.954Z
+OPEN  offline shuttle-03 at 2026-09-17T22:25:00.954Z
+CLOSE speeding shuttle-01 (timed_out)
+CLOSE speeding shuttle-03 (timed_out)
+```
+
+Episodes about something observable close, because observation stopped. Episodes
+about the absence of observation open, and stay open until a reading arrives.
+
+### What it produces
+
+```sql
+SELECT vehicle_id, alert_type, subject, opened_at, closed_at, close_reason,
+       round(EXTRACT(EPOCH FROM (closed_at - opened_at))) AS seconds
+FROM alert ORDER BY opened_at DESC;
+```
+
+```
+ vehicle_id |   alert_type   |   subject    |         opened_at          |         closed_at          | close_reason | seconds
+------------+----------------+--------------+----------------------------+----------------------------+--------------+---------
+ shuttle-03 | speeding       |              | 2026-09-17 20:45:36.483+00 | 2026-09-17 20:46:02.508+00 | timed_out    |      26
+ shuttle-02 | speeding       |              | 2026-09-17 20:45:25.472+00 | 2026-09-17 20:46:06.513+00 | timed_out    |      41
+ shuttle-01 | speeding       |              | 2026-09-17 20:45:03.447+00 | 2026-09-17 20:45:51.496+00 | resolved     |      48
+ shuttle-03 | zone_violation | service-yard | 2026-09-17 20:44:41.423+00 | 2026-09-17 20:45:42.485+00 | resolved     |      61
+ shuttle-02 | speeding       |              | 2026-09-17 20:44:06.392+00 | 2026-09-17 20:44:48.429+00 | resolved     |      42
+ shuttle-03 | speeding       |              | 2026-09-17 20:44:06.392+00 | 2026-09-17 20:44:53.435+00 | resolved     |      47
+ shuttle-01 | speeding       |              | 2026-09-17 20:44:06.392+00 | 2026-09-17 20:44:56.438+00 | resolved     |      50
+```
+
+Read as an operator would: buses speed for 42–50 seconds at a stretch, which is the
+accelerate-cruise-decelerate rhythm between stops. `shuttle-03` spends 61 seconds in
+the service yard on each pass — the same duration every time, which is what you would
+expect from a fixed route and would investigate on a real fleet.
+
+Live state through the API:
+
+```bash
+curl -s 'localhost:3000/alerts?open=true'
+```
+
+```json
+{
+  "count": 1,
+  "alerts": [
+    {
+      "vehicleId": "shuttle-02",
+      "alertType": "zone_violation",
+      "subject": "service-yard",
+      "openedAt": "2026-09-17T21:57:41.345Z",
+      "closedAt": null,
+      "closeReason": null,
+      "lat": 40.003037,
+      "lon": -83.0332,
+      "detail": { "rule": "must_stay_outside", "zoneName": "Service yard" },
+      "durationSec": 91
+    }
+  ]
+}
+```
+
+`durationSec` on an open episode counts to now, so it grows on each request — which
+is what a dispatcher watching a live incident wants.
+
+### Not done yet
+
+**Schedule adherence.** Detecting arrival at a stop from a position stream — rather
+than being told about it — is a bigger problem than the three alert types combined,
+and it needs its own slice.
+
+**Offline detection is live-only.** It reads `vehicle_status`, which holds one
+current row per vehicle with no history, so it cannot reconstruct a past silence the
+way the other two types reconstruct from stored telemetry. If the detector is down
+while a vehicle is offline and both recover, that outage goes unrecorded. Catching it
+would mean detecting gaps in `telemetry` rather than reading current state.
+
+**Driver assignment and scheduled lock/unlock** are in the original scope and
+deliberately cut. Both are CRUD around a user model that does not exist yet, and
+neither demonstrates anything the three implemented types do not.
+
 ## Kubernetes (slice 5)
 
 The same stack runs on Kubernetes, in `k8s/`. Compose was the right tool for building
@@ -351,7 +589,7 @@ docker compose build
 docker save campus-shuttle-telemetry-ingest:latest -o ingest.tar
 docker cp ingest.tar <node>:/ingest.tar
 docker exec <node> ctr -n k8s.io images import /ingest.tar
-# …repeat for api and simulator
+# …repeat for api, simulator and detector
 
 # the schema is generated from the file rather than duplicated in YAML
 kubectl create configmap timescale-init --from-file=db/init/001_schema.sql
@@ -373,9 +611,9 @@ passes — the same ordering guarantee `depends_on: service_healthy` gave in Com
 except it also applies continuously, so an API pod that loses its database connection
 is removed from the load balancer instead of serving errors.
 
-**`imagePullPolicy: Never`** on the three local images. Without it Kubernetes tries to
-pull `:latest` from a registry, finds nothing, and fails despite the image being
-present on the node.
+**`imagePullPolicy: Never`** on the local images. Without it Kubernetes tries to pull
+`:latest` from a registry, finds nothing, and fails despite the image being present
+on the node.
 
 ### Rolling updates fail safely
 
@@ -473,16 +711,17 @@ Horizontal pod autoscaling and an Ingress. Scaling here is manual
 - [x] **Slice 2** — fault injection: dropouts, reconnects with buffered replay, out-of-order
       and duplicate delivery. Measured: 0 lost readings and 0 duplicate rows across 123
       outages. Clock skew deliberately deferred — see above.
+- [x] **Slice 3** — domain layer: zones, geofence and speed alerts as episodes with
+      resolved/timed-out close reasons, offline detection, alert API and dashboard panels.
+      Schedule adherence deferred — see above.
 - [x] **Slice 4** — Grafana, provisioned from the repo: geomap of live positions, readings
-      per minute by device clock vs arrival, delivery lag percentiles, and gap and
-      duplicate tiles that go red if either stops being zero
+      per minute by device clock vs arrival, delivery lag percentiles, open alerts, alert
+      rate, and gap and duplicate tiles that go red if either stops being zero
 - [x] **CI** — full stack stood up on every push, fault injection enabled, build fails if a
       single reading is lost or duplicated
 - [x] **Slice 5** — Kubernetes: StatefulSet for the database, Deployments for the rest,
       readiness probes, rolling update and rollback, load tested to 280 writes/sec.
       HPA and Ingress deferred — see above.
-- [ ] **Slice 3** — domain layer: routes, stops, schedules, driver assignment, geofences,
-      speed thresholds, scheduled lock/unlock, alerting
 - [ ] **Slice 6** — Terraform for the whole stack, remote state, dev/prod workspaces
 - [ ] **Slice 7** — second vertical (hospital patient transport) on the same core, as proof
       the domain separation holds
@@ -498,5 +737,6 @@ mosquitto/          broker config
 grafana/            provisioned datasource and dashboard
 services/simulator/ vehicle motion model + MQTT publisher
 services/ingest/    subscriber, validation, batched writes
+services/detector/  geometry, rules, episode reconciliation
 services/api/       read API and OpenAPI spec
 ```
