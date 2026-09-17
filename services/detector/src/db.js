@@ -115,3 +115,30 @@ export async function updatePeaks(updates) {
     );
   }
 }
+
+// Vehicles whose last reading is older than the threshold. This is the one
+// alert driven by absence rather than by evaluating a reading, so it reads
+// vehicle_status rather than telemetry.
+export async function findSilentVehicles(before, silentSec) {
+  const { rows } = await pool.query(
+    `SELECT vehicle_id, last_seen
+       FROM vehicle_status
+      WHERE last_seen IS NOT NULL
+        AND last_seen < $1::timestamptz - make_interval(secs => $2)`,
+    [before, silentSec],
+  );
+  return rows;
+}
+
+export async function findRecoveredVehicles(before, silentSec) {
+  const { rows } = await pool.query(
+    `SELECT a.vehicle_id, s.last_seen
+       FROM alert a
+       JOIN vehicle_status s ON s.vehicle_id = a.vehicle_id
+      WHERE a.alert_type = 'offline'
+        AND a.closed_at IS NULL
+        AND s.last_seen >= $1::timestamptz - make_interval(secs => $2)`,
+    [before, silentSec],
+  );
+  return rows;
+}

@@ -1,16 +1,27 @@
-import { evaluate } from './rules.js';
-import { reconcile, findTimedOut } from './episodes.js';
+import { evaluate } from "./rules.js";
+import { reconcile, findTimedOut } from "./episodes.js";
 import {
-  pool, loadZones, getCursor, setCursor, readWindow,
-  loadOpenAlerts, lastSeenPerVehicle, openAlerts, closeAlerts, updatePeaks,
-} from './db.js';
+  pool,
+  loadZones,
+  getCursor,
+  setCursor,
+  readWindow,
+  loadOpenAlerts,
+  lastSeenPerVehicle,
+  openAlerts,
+  closeAlerts,
+  updatePeaks,
+  findSilentVehicles,
+  findRecoveredVehicles,
+} from "./db.js";
 
-const POLL_MS         = Number(process.env.POLL_MS ?? 3000);
-const WATERMARK_SEC   = Number(process.env.WATERMARK_SEC ?? 60);
+const POLL_MS = Number(process.env.POLL_MS ?? 3000);
+const WATERMARK_SEC = Number(process.env.WATERMARK_SEC ?? 60);
 const EPISODE_TIMEOUT_SEC = Number(process.env.EPISODE_TIMEOUT_SEC ?? 120);
 const SPEED_LIMIT_KPH = Number(process.env.SPEED_LIMIT_KPH ?? 40);
-const ZONE_TTL_MS     = Number(process.env.ZONE_TTL_MS ?? 60000);
-const MAX_WINDOW      = Number(process.env.MAX_WINDOW ?? 5000);
+const ZONE_TTL_MS = Number(process.env.ZONE_TTL_MS ?? 60000);
+const MAX_WINDOW = Number(process.env.MAX_WINDOW ?? 5000);
+const OFFLINE_AFTER_SEC = Number(process.env.OFFLINE_AFTER_SEC ?? 120);
 
 let zones = [];
 let zonesLoadedAt = 0;
@@ -27,7 +38,14 @@ async function getZones() {
   return zones;
 }
 
-const stats = { cycles: 0, readings: 0, opened: 0, closed: 0, timedOut: 0, errors: 0 };
+const stats = {
+  cycles: 0,
+  readings: 0,
+  opened: 0,
+  closed: 0,
+  timedOut: 0,
+  errors: 0,
+};
 
 async function cycle() {
   const activeZones = await getZones();
@@ -56,6 +74,37 @@ async function cycle() {
     timeoutMs: EPISODE_TIMEOUT_SEC * 1000,
   });
 
+  // Handling offline
+  const openOffline = new Set(
+    openBefore
+      .filter((a) => a.alert_type === "offline")
+      .map((a) => a.vehicle_id),
+  );
+
+  const silent = await findSilentVehicles(watermark, OFFLINE_AFTER_SEC);
+  for (const v of silent) {
+    if (openOffline.has(v.vehicle_id)) continue;
+    toOpen.push({
+      vehicle_id: v.vehicle_id,
+      alert_type: "offline",
+      subject: "",
+      opened_at: v.last_seen,
+      lat: null,
+      lon: null,
+      peak: null,
+      detail: { lastSeen: v.last_seen },
+    });
+  }
+
+  const recovered = await findRecoveredVehicles(watermark, OFFLINE_AFTER_SEC);
+  for (const v of recovered) {
+    const alert = openBefore.find(
+      (a) => a.alert_type === "offline" && a.vehicle_id === v.vehicle_id,
+    );
+    if (alert)
+      toClose.push({ alert, closedAt: v.last_seen, reason: "resolved" });
+  }
+
   // Order matters: open first, then close. A window that both opens and closes
   // an episode must have the row to update by the time the close runs.
   const opened = await openAlerts(toOpen);
@@ -64,9 +113,10 @@ async function cycle() {
 
   // Advance only as far as we actually read. If the window hit MAX_WINDOW the
   // remainder is picked up next cycle rather than skipped.
-  const newCursor = readings.length === MAX_WINDOW
-    ? readings[readings.length - 1].device_ts
-    : watermark;
+  const newCursor =
+    readings.length === MAX_WINDOW
+      ? readings[readings.length - 1].device_ts
+      : watermark;
   await setCursor(newCursor);
 
   stats.cycles += 1;
@@ -76,16 +126,20 @@ async function cycle() {
   stats.timedOut += timedOut.length;
 
   for (const e of toOpen) {
-    console.log(`[detector] OPEN  ${e.alert_type}${e.subject ? '/' + e.subject : ''} ${e.vehicle_id} at ${e.opened_at.toISOString()}`);
+    console.log(
+      `[detector] OPEN  ${e.alert_type}${e.subject ? "/" + e.subject : ""} ${e.vehicle_id} at ${e.opened_at.toISOString()}`,
+    );
   }
   for (const c of [...toClose, ...timedOut]) {
-    console.log(`[detector] CLOSE ${c.alert.alert_type}${c.alert.subject ? '/' + c.alert.subject : ''} ${c.alert.vehicle_id} (${c.reason})`);
+    console.log(
+      `[detector] CLOSE ${c.alert.alert_type}${c.alert.subject ? "/" + c.alert.subject : ""} ${c.alert.vehicle_id} (${c.reason})`,
+    );
   }
 }
 
 console.log(
   `[detector] poll ${POLL_MS}ms · watermark ${WATERMARK_SEC}s · ` +
-  `episode timeout ${EPISODE_TIMEOUT_SEC}s · speed limit ${SPEED_LIMIT_KPH} km/h`,
+    `episode timeout ${EPISODE_TIMEOUT_SEC}s · speed limit ${SPEED_LIMIT_KPH} km/h`,
 );
 
 const timer = setInterval(() => {
@@ -94,14 +148,14 @@ const timer = setInterval(() => {
     // The cursor is only advanced on success, so a failed cycle is retried
     // rather than skipped. Reprocessing is safe: reconcile() will not reopen
     // an episode it can see is open, and the insert is idempotent anyway.
-    console.error('[detector] cycle failed:', err.message);
+    console.error("[detector] cycle failed:", err.message);
   });
 }, POLL_MS);
 
 const statsTimer = setInterval(() => {
   console.log(
     `[detector] cycles=${stats.cycles} readings=${stats.readings} ` +
-    `opened=${stats.opened} closed=${stats.closed} timedOut=${stats.timedOut} errors=${stats.errors}`,
+      `opened=${stats.opened} closed=${stats.closed} timedOut=${stats.timedOut} errors=${stats.errors}`,
   );
 }, 30000);
 
@@ -111,5 +165,5 @@ async function shutdown() {
   await pool.end();
   process.exit(0);
 }
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);

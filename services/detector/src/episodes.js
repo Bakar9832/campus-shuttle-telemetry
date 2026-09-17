@@ -79,6 +79,7 @@ export function findTimedOut({ stillOpen, lastSeenByVehicle, watermark, timeoutM
   const timedOut = [];
 
   for (const alert of stillOpen) {
+    if (alert.alert_type === 'offline') continue;
     const lastSeen = lastSeenByVehicle.get(alert.vehicle_id);
     if (lastSeen && lastSeen > cutoff) continue;
     timedOut.push({
