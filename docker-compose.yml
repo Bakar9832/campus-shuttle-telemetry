@@ -66,6 +66,19 @@ services:
       mosquitto:
         condition: service_started
     restart: unless-stopped
+  
+  detector:
+    build: ./services/detector
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-telemetry}:${POSTGRES_PASSWORD:-telemetry}@timescale:5432/${POSTGRES_DB:-telemetry}
+      POLL_MS: ${POLL_MS:-3000}
+      WATERMARK_SEC: ${WATERMARK_SEC:-60}
+      EPISODE_TIMEOUT_SEC: ${EPISODE_TIMEOUT_SEC:-120}
+      SPEED_LIMIT_KPH: ${SPEED_LIMIT_KPH:-40}
+    depends_on:
+      timescale:
+        condition: service_healthy
+    restart: unless-stopped
 
   grafana:
     image: grafana/grafana:11.3.0
