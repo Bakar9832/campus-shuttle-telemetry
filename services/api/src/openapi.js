@@ -52,5 +52,25 @@ export const openapi = {
         responses: { 200: { description: 'Time bucketed counts' } },
       },
     },
+        '/alerts': {
+      get: {
+        summary: 'Alert episodes, newest first',
+        parameters: [
+          { name: 'open', in: 'query', schema: { type: 'boolean' }, description: 'Only episodes that have not closed' },
+          { name: 'limit', in: 'query', schema: { type: 'integer', default: 100, maximum: 1000 } },
+        ],
+        responses: { 200: { description: 'Alert episodes' } },
+      },
+    },
+    '/vehicles/{id}/alerts': {
+      get: {
+        summary: 'Alert history for one vehicle',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string' } },
+          { name: 'limit', in: 'query', schema: { type: 'integer', default: 100, maximum: 1000 } },
+        ],
+        responses: { 200: { description: 'Alert episodes for the vehicle' } },
+      },
+    },
   },
 };

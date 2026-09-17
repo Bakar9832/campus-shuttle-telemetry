@@ -105,6 +105,47 @@ app.get('/metrics/ingest', wrap(async (_req, res) => {
   res.json({ buckets: rows });
 }));
 
+app.get('/alerts', wrap(async (req, res) => {
+  const open = req.query.open === 'true';
+  const limit = Math.min(Number(req.query.limit ?? 100) || 100, 1000);
+
+  const { rows } = await pool.query(
+    `SELECT vehicle_id  AS "vehicleId",
+            alert_type  AS "alertType",
+            NULLIF(subject, '') AS subject,
+            opened_at   AS "openedAt",
+            closed_at   AS "closedAt",
+            close_reason AS "closeReason",
+            lat, lon, peak, detail,
+            round(EXTRACT(EPOCH FROM (COALESCE(closed_at, now()) - opened_at)))::int AS "durationSec"
+       FROM alert
+      WHERE ($1::boolean IS NOT TRUE OR closed_at IS NULL)
+      ORDER BY opened_at DESC
+      LIMIT $2`,
+    [open, limit],
+  );
+  res.json({ count: rows.length, alerts: rows });
+}));
+
+app.get('/vehicles/:id/alerts', wrap(async (req, res) => {
+  const limit = Math.min(Number(req.query.limit ?? 100) || 100, 1000);
+  const { rows } = await pool.query(
+    `SELECT alert_type AS "alertType",
+            NULLIF(subject, '') AS subject,
+            opened_at  AS "openedAt",
+            closed_at  AS "closedAt",
+            close_reason AS "closeReason",
+            peak, detail,
+            round(EXTRACT(EPOCH FROM (COALESCE(closed_at, now()) - opened_at)))::int AS "durationSec"
+       FROM alert
+      WHERE vehicle_id = $1
+      ORDER BY opened_at DESC
+      LIMIT $2`,
+    [req.params.id, limit],
+  );
+  res.json({ vehicleId: req.params.id, count: rows.length, alerts: rows });
+}));
+
 app.use('/docs', swaggerUi.serve, swaggerUi.setup(openapi));
 app.get('/openapi.json', (_req, res) => res.json(openapi));
 
