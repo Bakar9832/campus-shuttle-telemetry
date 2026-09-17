@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingest
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ingest
+  template:
+    metadata:
+      labels:
+        app: ingest
+    spec:
+      containers:
+        - name: ingest
+          image: campus-shuttle-telemetry-ingest:latest
+          imagePullPolicy: Never
+          env:
+            - name: MQTT_URL
+              value: mqtt://mosquitto:1883
+            - name: FLUSH_MS
+              value: "500"
+            - name: MAX_BATCH
+              value: "200"
+            - name: DATABASE_URL
+              value: postgres://telemetry:telemetry@timescale:5432/telemetry

@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: timescale-credentials
+type: Opaque
+stringData:
+  POSTGRES_USER: telemetry
+  POSTGRES_PASSWORD: telemetry
+  POSTGRES_DB: telemetry
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: timescale
+spec:
+  serviceName: timescale
+  replicas: 1
+  selector:
+    matchLabels:
+      app: timescale
+  template:
+    metadata:
+      labels:
+        app: timescale
+    spec:
+      containers:
+        - name: timescale
+          image: timescale/timescaledb:latest-pg16
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: timescale-credentials
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "telemetry", "-d", "telemetry"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      volumes:
+        - name: init
+          configMap:
+            name: timescale-init
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: timescale
+spec:
+  selector:
+    app: timescale
+  ports:
+    - port: 5432
+      targetPort: 5432

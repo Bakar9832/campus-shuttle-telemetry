@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: simulator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: simulator
+  template:
+    metadata:
+      labels:
+        app: simulator
+    spec:
+      containers:
+        - name: simulator
+          image: campus-shuttle-telemetry-simulator:latest
+          imagePullPolicy: Never
+          env:
+            - name: MQTT_URL
+              value: mqtt://mosquitto:1883
+            - name: FLEET_SIZE
+              value: "100"
+            - name: TICK_MS
+              value: "1000"
+            - name: ROUTE_FILE
+              value: ./routes/campus-loop.json
+            - name: DROPOUT_CHANCE
+              value: "0.02"
+            - name: DROPOUT_MIN_SEC
+              value: "15"
+            - name: DROPOUT_MAX_SEC
+              value: "45"
+            - name: MAX_BUFFER
+              value: "3600"
+            - name: REPLAY_SHUFFLE
+              value: "true"
+            - name: DUPLICATE_CHANCE
+              value: "0.02"
