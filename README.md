@@ -14,7 +14,8 @@ enough to put on a map and bill against.
 92% of the time, across 123 separate outages. Zero readings lost, zero duplicate
 rows. The [queries and their output](#fault-injection-slice-2) are below.
 
-**Status:** slices 1, 2 and 4 complete. See [Roadmap](#roadmap) for what is next.
+**Status:** slices 1, 2, 4 and 5 complete. Runs under Docker Compose or Kubernetes.
+See [Roadmap](#roadmap) for what is next.
 
 ---
 
@@ -338,6 +339,134 @@ silently discard the second. The same mechanism that makes duplicates free makes
 skew lossy. Fixing it properly means a sequence-aware key or a skew correction on
 ingest, so it is deliberately held back rather than half-implemented.
 
+## Kubernetes (slice 5)
+
+The same stack runs on Kubernetes, in `k8s/`. Compose was the right tool for building
+it; Kubernetes is where the stateful-versus-stateless distinction stops being
+theoretical.
+
+```bash
+# images are local, so load them into the cluster's containerd store first
+docker compose build
+docker save campus-shuttle-telemetry-ingest:latest -o ingest.tar
+docker cp ingest.tar <node>:/ingest.tar
+docker exec <node> ctr -n k8s.io images import /ingest.tar
+# …repeat for api and simulator
+
+# the schema is generated from the file rather than duplicated in YAML
+kubectl create configmap timescale-init --from-file=db/init/001_schema.sql
+
+kubectl apply -f k8s/
+kubectl port-forward service/api 3000:3000
+```
+
+**TimescaleDB is a StatefulSet, everything else is a Deployment.** A Deployment
+treats pods as interchangeable — any one can be replaced by any other, in any order.
+A database cannot work that way: it owns specific data on specific storage. The
+StatefulSet gives it a stable identity (`timescale-0`) and a `volumeClaimTemplate`
+that binds it to its own volume permanently. The API only reads, so it runs two
+replicas behind a Service and scales by changing one number.
+
+**The readiness probe replaces the Compose healthcheck.** `pg_isready` for Timescale,
+`GET /health` for the API. Kubernetes will not route traffic to a pod until its probe
+passes — the same ordering guarantee `depends_on: service_healthy` gave in Compose,
+except it also applies continuously, so an API pod that loses its database connection
+is removed from the load balancer instead of serving errors.
+
+**`imagePullPolicy: Never`** on the three local images. Without it Kubernetes tries to
+pull `:latest` from a registry, finds nothing, and fails despite the image being
+present on the node.
+
+### Rolling updates fail safely
+
+Deploying a broken image and watching what happens is more informative than reading
+about it:
+
+```bash
+kubectl set image deployment/api api=campus-shuttle-telemetry-api:broken
+kubectl get pods
+```
+
+```
+api-57bbd7f777-hbchp   0/1   ErrImageNeverPull   0   5s
+api-57bbd7f777-nczdb   0/1   ErrImageNeverPull   0   5s
+api-57bbd7f777-tqkfn   0/1   ErrImageNeverPull   0   4s
+api-57fcd47f75-4xmbb   1/1   Running             0   6m14s
+api-57fcd47f75-7hmsd   1/1   Running             0   17m
+api-57fcd47f75-dch5m   1/1   Running             0   17m
+api-57fcd47f75-sh5kc   1/1   Running             0   6m14s
+```
+
+Three new pods stuck, four old pods still serving. `kubectl rollout status` hangs at
+"3 out of 5 new replicas have been updated" and would wait indefinitely. The default
+rolling update strategy will not remove a working pod until its replacement is ready,
+so a bad deploy stalls rather than causing an outage. `kubectl rollout undo` restores
+the previous revision — though in a real workflow the fix is to correct the manifest
+and re-apply, so git stays the source of truth.
+
+### Load test
+
+100 vehicles at 1 Hz through a single ingest pod:
+
+```
+[ingest] received=26446 written=26169 dropped=0 errors=0 buffered=110
+[ingest] received=27608 written=27324 dropped=0 errors=0 buffered=106
+[ingest] received=28827 written=28545 dropped=0 errors=0 buffered=95
+```
+
+```
+ readings | vehicles | per_second
+----------+----------+------------
+     5264 |      100 |         88
+```
+
+88 writes/sec sustained, nothing dropped. `buffered` oscillates between 80 and 110
+rather than climbing — that is one flush cycle's worth of messages in flight at any
+moment, which is what a 500 ms flush window at this rate should look like. A leaking
+buffer would march past 500, then 1000, and keep going.
+
+Scaling the producer to four pods pushed it to 280 writes/sec with `buffered` stable
+in the 200–400 band, so the ceiling is somewhere above that.
+
+Note that scaling *ingest* horizontally would not help. MQTT delivers each message to
+every subscriber, so two ingest pods would each write everything — double the database
+load for no extra throughput. Fixing that properly needs shared subscriptions or
+partitioning by vehicle, not more replicas.
+
+### What the load test accidentally proved
+
+Those four simulator replicas all used the same `FLEET_SIZE`, so all four published as
+`shuttle-01` … `shuttle-100`. They started milliseconds apart, so their `device_ts`
+values differed and every reading was stored as a distinct row:
+
+```
+         device_ts          |    lat    |    lon
+----------------------------+-----------+------------
+ 2026-09-17 10:34:48.183+00 | 40.002763 | -83.022779
+ 2026-09-17 10:34:48.153+00 | 40.002763 | -83.022779
+ 2026-09-17 10:34:48.035+00 | 40.000931 | -83.032545
+```
+
+Two readings 30 ms apart at the same coordinates, and a third nearly a kilometre away
+120 ms later — all claiming to be the same vehicle.
+
+**Every integrity assertion still passed.** No gaps, no duplicate keys, monotonic on
+`device_ts`, nothing rejected by validation. The readings are individually well-formed
+and uniquely keyed; the track they describe is physically impossible.
+
+Delivery correctness and identity correctness are different properties, and only the
+first is currently tested. A speed-plausibility check between consecutive readings
+would catch it — 900 metres in 120 ms is 27,000 km/h — and that is the obvious next
+assertion. It is also why auto-registering a device on first sighting is a shortcut:
+real fleets provision device identities rather than trusting whatever an unknown
+publisher claims to be.
+
+### Not done yet
+
+Horizontal pod autoscaling and an Ingress. Scaling here is manual
+(`kubectl scale deployment api --replicas=5`), and external access is via
+`kubectl port-forward` rather than a routed hostname.
+
 ## Roadmap
 
 - [x] **Slice 1** — simulator, broker, ingest, TimescaleDB, REST + OpenAPI, all in compose
@@ -349,9 +478,11 @@ ingest, so it is deliberately held back rather than half-implemented.
       duplicate tiles that go red if either stops being zero
 - [x] **CI** — full stack stood up on every push, fault injection enabled, build fails if a
       single reading is lost or duplicated
+- [x] **Slice 5** — Kubernetes: StatefulSet for the database, Deployments for the rest,
+      readiness probes, rolling update and rollback, load tested to 280 writes/sec.
+      HPA and Ingress deferred — see above.
 - [ ] **Slice 3** — domain layer: routes, stops, schedules, driver assignment, geofences,
       speed thresholds, scheduled lock/unlock, alerting
-- [ ] **Slice 5** — Kubernetes with horizontal autoscaling under simulated fleet load
 - [ ] **Slice 6** — Terraform for the whole stack, remote state, dev/prod workspaces
 - [ ] **Slice 7** — second vertical (hospital patient transport) on the same core, as proof
       the domain separation holds
@@ -362,6 +493,7 @@ ingest, so it is deliberately held back rather than half-implemented.
 .github/workflows/  CI pipeline
 ci/verify.sh        integration assertions, runnable locally
 db/init/            schema, applied on first database start
+k8s/                Kubernetes manifests
 mosquitto/          broker config
 grafana/            provisioned datasource and dashboard
 services/simulator/ vehicle motion model + MQTT publisher
