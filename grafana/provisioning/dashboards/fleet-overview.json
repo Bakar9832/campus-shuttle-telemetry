@@ -238,6 +238,43 @@
       ],
       "options": { "colorMode": "value", "graphMode": "none", "textMode": "value" },
       "fieldConfig": { "defaults": { "unit": "s", "decimals": 1, "color": { "mode": "fixed", "fixedColor": "text" } }, "overrides": [] }
+    },
+    {
+      "id": 9,
+      "type": "table",
+      "title": "Open alerts",
+      "description": "Episodes that have not closed. Duration counts from the device clock at which the condition started, not from when the detector noticed.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 26 },
+      "datasource": { "type": "postgres", "uid": "telemetry-db" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT vehicle_id AS \"Vehicle\",\n       alert_type AS \"Type\",\n       NULLIF(subject, '') AS \"Subject\",\n       round(EXTRACT(EPOCH FROM (now() - opened_at)))::int AS \"Open for (s)\",\n       peak AS \"Peak\"\n  FROM alert\n WHERE closed_at IS NULL\n ORDER BY opened_at ASC"
+        }
+      ],
+      "options": { "showHeader": true },
+      "fieldConfig": { "defaults": { "custom": { "align": "left" } }, "overrides": [] }
+    },
+        {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Alerts opened per minute",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 26 },
+      "datasource": { "type": "postgres", "uid": "telemetry-db" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT time_bucket('1 minute', opened_at) AS time,\n       alert_type AS metric,\n       count(*) AS value\n  FROM alert\n WHERE $__timeFilter(opened_at)\n GROUP BY time, alert_type\n ORDER BY time"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "lineWidth": 2, "fillOpacity": 10, "showPoints": "auto" } },
+        "overrides": []
+      }
     }
   ]
 }
