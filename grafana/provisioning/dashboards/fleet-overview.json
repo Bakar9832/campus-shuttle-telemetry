@@ -45,11 +45,17 @@
         "controls": { "showZoom": true, "showAttribution": true }
       },
       "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "continuous-GrYlRd" },
-          "unit": "velocitykmh"
-        },
-        "overrides": []
+        "defaults": { "color": { "mode": "continuous-GrYlRd" } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "speed_kph" },
+            "properties": [{ "id": "unit", "value": "velocitykmh" }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "battery_pct" },
+            "properties": [{ "id": "unit", "value": "percent" }]
+          }
+        ]
       }
     },
     {
