@@ -62,6 +62,11 @@ interrupted, only its delivery. The gap and duplicate tiles are the integrity
 queries from [below](#fault-injection-slice-2), running live; they turn red if
 either stops being zero.
 
+[Watch the dashboard during an outage](https://github.com/user-attachments/assets/c01280ce-88ad-459a-9c5d-75c53f5378a2) — 45 seconds: three
+vehicles reporting, coverage lost, the arrival line collapsing while the device
+clock line holds, and the backlog landing on reconnect with the integrity tiles
+still at zero.
+
 ## Running it
 
 ```bash
