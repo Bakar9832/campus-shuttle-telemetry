@@ -5,3 +5,6 @@ Muhammad_Abu_Bakar_CV.docx
 six_month_plan.md
 project_brief.md
 *.tar
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.backup
