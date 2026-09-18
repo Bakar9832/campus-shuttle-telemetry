@@ -15,8 +15,8 @@ enough to put on a map and bill against.
 92% of the time, across 123 separate outages. Zero readings lost, zero duplicate
 rows. The [queries and their output](#fault-injection-slice-2) are below.
 
-**Status:** slices 1–5 complete. Runs under Docker Compose or Kubernetes.
-See [Roadmap](#roadmap) for what is next.
+**Status:** slices 1–5 complete, slice 6 partial. Runs under Docker Compose or
+Kubernetes. See [Roadmap](#roadmap) for what is next.
 
 ---
 
@@ -705,6 +705,78 @@ Horizontal pod autoscaling and an Ingress. Scaling here is manual
 (`kubectl scale deployment api --replicas=5`), and external access is via
 `kubectl port-forward` rather than a routed hostname.
 
+## Terraform (slice 6, partial)
+
+`k8s/` is a folder of YAML applied with `kubectl`. That works, but `kubectl apply`
+has no memory: delete a manifest and the resource stays in the cluster, orphaned,
+because nothing recorded that it was ever created. Terraform keeps a state file, so
+it knows what it made and can tell you what drifted.
+
+`terraform/` provisions the same resources against the local cluster:
+
+```bash
+cd terraform
+terraform init
+terraform workspace select dev
+terraform plan
+terraform apply
+```
+
+```
+kubernetes_namespace.telemetry: Creation complete after 0s [id=telemetry-prod]
+kubernetes_service.mosquitto: Creating...
+kubernetes_deployment.mosquitto: Creating...
+kubernetes_service.mosquitto: Creation complete after 0s [id=telemetry-prod/mosquitto]
+kubernetes_deployment.mosquitto: Creation complete after 2s [id=telemetry-prod/mosquitto]
+
+Apply complete! Resources: 3 added, 0 changed, 0 destroyed.
+```
+
+Two things in that output are the reason for using it at all.
+
+**The dependency graph is inferred, not declared.** The namespace completes first,
+then the service and deployment start *simultaneously*, because neither depends on
+the other. Nothing in the config says "namespace first" — it follows from the
+deployment referencing `kubernetes_namespace.telemetry.metadata[0].name`. Terraform
+builds the graph from those references, parallelises what it safely can, and destroys
+in reverse order.
+
+**Drift is visible.** Delete the namespace by hand and `terraform plan` reports
+`1 to add`, because state and reality disagree. `kubectl apply` has no concept of
+this: it will happily create what you ask for and has no opinion about anything it
+created previously.
+
+Environments are workspaces, each with isolated state, and the namespace name carries
+the workspace so they cannot collide:
+
+```hcl
+resource "kubernetes_namespace" "telemetry" {
+  metadata {
+    name = "${var.namespace}-${terraform.workspace}"
+  }
+}
+```
+
+```
+NAME             STATUS   AGE
+telemetry-dev    Active   40s
+telemetry-prod   Active   12s
+```
+
+Same files, two complete environments, separate state.
+
+### Not done yet
+
+**Only the namespace and the broker are ported.** The remaining services are still
+YAML under `k8s/`. The obvious next step is a module — the three Node services are
+identical in shape (deployment, image, env vars), so that is one module invoked three
+times rather than three near-identical resource blocks.
+
+**State is local.** `terraform.tfstate` sits on disk, which is fine for one person
+and wrong for a team: two simultaneous applies would corrupt it. The real answer is a
+remote backend — S3 for the state with a DynamoDB table for locking — and that needs
+an AWS account, so it waits for the cloud slice rather than being faked locally.
+
 ## Roadmap
 
 - [x] **Slice 1** — simulator, broker, ingest, TimescaleDB, REST + OpenAPI, all in compose
@@ -722,7 +794,8 @@ Horizontal pod autoscaling and an Ingress. Scaling here is manual
 - [x] **Slice 5** — Kubernetes: StatefulSet for the database, Deployments for the rest,
       readiness probes, rolling update and rollback, load tested to 280 writes/sec.
       HPA and Ingress deferred — see above.
-- [ ] **Slice 6** — Terraform for the whole stack, remote state, dev/prod workspaces
+- [~] **Slice 6** — Terraform: Kubernetes provider, variables, dev/prod workspaces.
+      Namespace and broker ported; remaining services and remote state outstanding.
 - [ ] **Slice 7** — second vertical (hospital patient transport) on the same core, as proof
       the domain separation holds
 
@@ -733,6 +806,7 @@ Horizontal pod autoscaling and an Ingress. Scaling here is manual
 ci/verify.sh        integration assertions, runnable locally
 db/init/            schema, applied on first database start
 k8s/                Kubernetes manifests
+terraform/          same resources as HCL, with dev/prod workspaces
 mosquitto/          broker config
 grafana/            provisioned datasource and dashboard
 services/simulator/ vehicle motion model + MQTT publisher
